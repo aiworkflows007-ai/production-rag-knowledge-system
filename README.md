@@ -10,19 +10,25 @@ Most RAG tutorials demonstrate toy examples (simple chunking + naive vector sear
 
 - **Data Ingestion & Preprocessing**: Clean parsing, document structure awareness, dynamic and semantic chunking.
 - **Embedding Generation & Vector Storage**: Decoupled embedding providers, typed embedded chunks, and extensible vector storage.
+- **Vector Retrieval**: Query-time vector embedding, exact cosine similarity calculation, score ranking, and Top-K chunk selection.
 - **Hybrid Retrieval**: Combining dense vector embeddings (semantic similarity) with sparse retrieval (BM25 lexical search) via Reciprocal Rank Fusion (RRF).
 - **Post-Retrieval Processing & Re-ranking**: Cross-encoder rerankers, contextual compression, and relevance filtering to combat the "lost in the middle" phenomenon.
 - **Grounded Generation**: Prompt engineering with strict context bounding, source attribution, and citation enforcement.
 - **Evaluation & Observability**: Quantitative evaluation (faithfulness, answer relevance, context recall/precision) and token/latency tracing.
 
-> **Current Milestone**: **Ingestion, Chunking, Embedding Generation, & Vector Storage/Index**.
-> Architecture strictly decouples embedding models, data models, and vector stores without relying on bulky all-in-one frameworks.
+> **Current Milestone**: **Dense Vector Retrieval (Top-K Similarity Search)**.
+> Implemented query-time embedding, cosine similarity calculation, threshold filtering, and Top-K ranking using dependency injection without relying on third-party frameworks.
 
 ---
 
-## The Indexing Pipeline
+## Pipeline Lifecycle: Indexing Time vs. Query Time
+
+A fundamental architectural principle of RAG systems is the strict separation between **Indexing Time** (offline knowledge storage) and **Query Time** (online question answering).
 
 ```text
+========================================================================================
+INDEXING TIME (Offline Ingestion & Storage)
+========================================================================================
 Raw Document
      ↓
  Ingestion            (LocalFileLoader reads UTF-8, extracts title, assigns deterministic document_id)
@@ -32,139 +38,144 @@ Raw Document
  Embedding            (EmbeddingProvider transforms chunk text into dense numerical vectors)
      ↓
 Vector Store / Index  (BaseVectorStore indexes EmbeddedChunks for fast retrieval & metadata lookup)
+
+========================================================================================
+QUERY TIME (Online Search & Retrieval)
+========================================================================================
+User Query
+     ↓
+Query Embedding       (EmbeddingProvider embeds the query into the exact same vector space)
+     ↓
+Similarity Search     (VectorRetriever computes cosine similarity against all stored chunk vectors)
+     ↓
+Threshold Filtering   (Optional similarity_threshold excludes low-confidence chunks)
+     ↓
+Ranking & Slicing     (Orders results descending by score and slices Top-K candidates)
+     ↓
+Top-K Chunks          (List[RetrievalResult] preserving raw text, metadata, and scores)
 ```
 
 Detailed architectural visualization:
 
 ```
-┌──────────────────────────────────────────────┐
-│  Raw Documents (data/raw/*.md, *.txt)        │
-└──────────────────────┬───────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────┐
-│  LocalFileLoader                             │
-│  - UTF-8 decoding & validation               │
-│  - Heading & title extraction                │
-│  - Deterministic document_id generation      │
-└──────────────────────┬───────────────────────┘
-                       │ Document (Pydantic Model)
-                       ▼
-┌──────────────────────────────────────────────┐
-│  TextChunker                                 │
-│  - Sliding window (chunk_size, chunk_overlap)│
-│  - Delimiter boundary snapping (no cut words)│
-│  - Monotonic chunk_index (0, 1, 2, ...)      │
-└──────────────────────┬───────────────────────┘
-                       │ List[Chunk] (Pydantic Models)
-                       ▼
-┌──────────────────────────────────────────────┐
-│  EmbeddingProvider                           │
-│  - Decoupled interface (base.py)             │
-│  - LocalDeterministicEmbeddingProvider       │
-│  - Signed subword feature projection (D=128) │
-│  - Unit L2-normalized dense vectors          │
-└──────────────────────┬───────────────────────┘
-                       │ List[EmbeddedChunk]
-                       ▼
-┌──────────────────────────────────────────────┐
-│  VectorStore / Index (InMemoryVectorStore)   │
-│  - O(1) ID lookups & dimension validation    │
-│  - Preserves original chunk text & metadata  │
-│  - Foundation for future similarity search   │
-└──────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│ 1. INDEXING TIME PIPELINE                                   │
+│                                                             │
+│   Raw Documents (data/raw/*.md, *.txt)                      │
+│        │                                                    │
+│        ▼                                                    │
+│   LocalFileLoader (UTF-8, heading extraction, doc_id)       │
+│        │ [Document]                                         │
+│        ▼                                                    │
+│   TextChunker (delimiter snapping, sliding window)          │
+│        │ [List[Chunk]]                                      │
+│        ▼                                                    │
+│   EmbeddingProvider (dense normalized vectors)              │
+│        │ [List[EmbeddedChunk]]                              │
+│        ▼                                                    │
+│   InMemoryVectorStore (exact vector storage + records)      │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ 2. QUERY TIME RETRIEVAL PIPELINE (CURRENT MILESTONE)        │
+│                                                             │
+│   User Query: "Why does ingestion quality matter in RAG?"   │
+│        │                                                    │
+│        ▼                                                    │
+│   VectorRetriever.retrieve(query, top_k=3)                  │
+│        │                                                    │
+│        ▼                                                    │
+│   EmbeddingProvider.embed_text(query) ──> Query Vector [D]  │
+│        │                                                    │
+│        ▼                                                    │
+│   Exact Cosine Similarity Scan over Stored Chunk Vectors    │
+│   cos(theta) = (q . c) / (|q| * |c|)                        │
+│        │                                                    │
+│        ▼                                                    │
+│   Optional Threshold Cutoff (score >= threshold)            │
+│        │                                                    │
+│        ▼                                                    │
+│   Descending Score Sorting + Top-K Slicing                  │
+│        │                                                    │
+│        ▼                                                    │
+│   List[RetrievalResult]                                     │
+│   ├── chunk: EmbeddedChunk (original text, metadata)        │
+│   ├── score: float (similarity score for this query)        │
+│   └── metric: "cosine_similarity"                           │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Core Concepts: Embeddings & Vector Indexing
+## Important Architectural & Learning Principles
 
-### 1. WHAT is an embedding?
-An **embedding** is a dense numerical vector (a list of floating-point numbers, such as 128, 384, or 1536 dimensions) representing the syntactic and semantic essence of a text passage. Texts with similar topical meanings or vocabulary overlap map to coordinates that are mathematically close to one another in geometric vector space.
+### 1. Learning Embedding Provider vs. Pretrained Semantic Models
+> [!IMPORTANT]
+> The current [`LocalDeterministicEmbeddingProvider`](file:///home/ashok/Projects/production-rag-knowledge-system/src/production_rag/embeddings/local.py) is a **deterministic hash-based learning/development implementation** (using signed subword feature projections and $L_2$-normalization).
+> - It is **not** a pretrained neural semantic embedding model (like `all-MiniLM-L6-v2` or `text-embedding-3-small`).
+> - It is designed to run 100% offline, deterministically, with zero external dependencies and zero API costs.
+> - Because [`VectorRetriever`](file:///home/ashok/Projects/production-rag-knowledge-system/src/production_rag/retrieval/vector.py) relies strictly on the abstract [`EmbeddingProvider`](file:///home/ashok/Projects/production-rag-knowledge-system/src/production_rag/embeddings/base.py) interface via dependency injection, swapping to a neural model in future milestones requires changing only the injected provider class.
 
-### 2. WHY do we create embeddings?
-Computers cannot directly calculate semantic closeness using raw character strings. Traditional keyword matching fails when synonyms or rephrased queries are used (e.g., `"automobile repair"` vs `"car maintenance"`). Embeddings convert human language into geometric points, enabling algorithms to compute similarity using mathematical distance metrics.
+### 2. Exact Linear Comparison vs. ANN Index
+> [!NOTE]
+> The current [`InMemoryVectorStore`](file:///home/ashok/Projects/production-rag-knowledge-system/src/production_rag/indexing/memory.py) performs an **exact brute-force comparison ($O(N)$ linear scan)** over stored vectors.
+> - Exact search guarantees 100% recall and mathematical precision for small-to-medium corpora.
+> - It is **not yet an Approximate Nearest Neighbor (ANN)** index (such as HNSW, IVF, or ScaNN). ANN algorithms trade a tiny fraction of recall for sub-linear ($O(\log N)$) search speeds on million-scale vector collections.
 
-### 3. WHAT does the embedding model do?
-The **embedding model** (represented by `EmbeddingProvider`) is a pure transformation function:
-$$\text{text} \longrightarrow \text{vector} \in \mathbb{R}^D$$
-It accepts raw text, tokenizes it, and outputs a normalized fixed-dimensional vector. It does not store vectors or know about databases; its sole responsibility is vector generation.
+### 3. Similarity Scores Are Dynamic Query-Time Values
+> [!TIP]
+> A chunk **never has a static similarity score**.
+> - At **Indexing Time**: Chunks store their fixed embedding vector coordinate.
+> - At **Query Time**: When a query arrives, the query vector is compared against chunk vectors. The resulting similarity score reflects relevance *specifically to that query*.
+> - Scores are ephemeral and encapsulated inside [`RetrievalResult`](file:///home/ashok/Projects/production-rag-knowledge-system/src/production_rag/retrieval/models.py).
 
-### 4. WHAT does the vector index do?
-The **vector index / vector store** (`BaseVectorStore`) is a specialized data structure and storage engine that stores the embeddings together with their associated chunk metadata and raw text. In later retrieval stages, it organizes these high-dimensional points so that nearest-neighbor queries can be executed in sub-linear time.
-
-### 5. WHY do we keep the original chunk text?
-The embedding is purely a mathematical coordinate for spatial indexing; **it is NOT a replacement for the text**.
-- An embedding vector cannot be read by human users or passed directly into an LLM context window.
-- When relevant chunks are retrieved at query time, the system passes the **original human-readable text** into the LLM's prompt context to synthesize a truthful, grounded response with exact citations.
-- Therefore, `EmbeddedChunk` strictly preserves the original `text`, parent `document_id`, `chunk_id`, and `metadata`.
-
-### 6. IMPORTANT: Similarity Scores Are Computed at Query Time
-> **Critical Architectural Principle**:
-> A similarity score is **never permanently assigned** to a chunk during indexing.
-> - At **Indexing Time**: Chunks are embedded and their vectors are stored. There is no user query yet, so no similarity score exists.
-> - At **Query Time**: When a user asks a question, the *query itself* is converted into an embedding vector by the embedding model. That query vector is compared against all stored chunk vectors using a similarity metric (e.g., Cosine Similarity) to calculate a dynamic, query-specific relevance score.
+### 4. Similarity Thresholds Are Corpus- and Model-Dependent
+- The retriever supports an optional `similarity_threshold: float | None = None`.
+- We deliberately do **not** set an arbitrary default threshold (e.g. `0.7`). In production, similarity distributions vary radically based on the embedding model's dimensionality, pre-training objectives, normalization, and domain vocabulary.
 
 ---
 
-## Similarity Metrics Prepared
-
-The system prepares for future similarity search by producing L2-normalized unit vectors ($\|v\|_2 = 1.0$) and providing standard distance functions:
-
-1. **Cosine Similarity**:
-   $$\cos(\theta) = \frac{\mathbf{u} \cdot \mathbf{v}}{\|\mathbf{u}\|_2 \|\mathbf{v}\|_2}$$
-   Measures the angle between two vectors, invariant to scale, returning a value between $-1.0$ and $+1.0$.
-2. **Dot Product (Inner Product)**:
-   $$\mathbf{u} \cdot \mathbf{v} = \sum_{i=1}^D u_i v_i$$
-   For unit-normalized vectors ($\|\mathbf{u}\|_2 = \|\mathbf{v}\|_2 = 1$), dot product is mathematically equivalent to cosine similarity but computationally faster (requires no division).
-3. **Euclidean Distance (L2)**:
-   $$d(\mathbf{u}, \mathbf{v}) = \sqrt{\sum_{i=1}^D (u_i - v_i)^2}$$
-   Measures straight-line geometric distance. For unit vectors, Euclidean distance is monotonically related to cosine distance: $d^2 = 2 - 2\cos(\theta)$.
-
----
-
-## Example: Ingestion → Chunking → Embedding → Vector Storage
+## Example: Indexing and Top-K Vector Retrieval
 
 ```python
 from pathlib import Path
-from production_rag.embeddings import LocalDeterministicEmbeddingProvider, cosine_similarity
+from production_rag.embeddings import LocalDeterministicEmbeddingProvider
 from production_rag.indexing import InMemoryVectorStore
 from production_rag.ingestion import LocalFileLoader, TextChunker
 from production_rag.pipeline import IndexingPipeline
+from production_rag.retrieval import VectorRetriever
 
-# 1. Initialize components
+# 1. Initialize core components
 loader = LocalFileLoader(base_dir=Path("data/raw"))
 chunker = TextChunker(chunk_size=350, chunk_overlap=50)
 embedder = LocalDeterministicEmbeddingProvider(dimension=128)
 vector_store = InMemoryVectorStore()
 
-# 2. Build and run the indexing pipeline
-pipeline = IndexingPipeline(
+# 2. Run Indexing Time pipeline
+indexing_pipeline = IndexingPipeline(
     loader=loader,
     chunker=chunker,
     embedder=embedder,
     vector_store=vector_store,
 )
+indexing_pipeline.index_file("rag_principles.md")
+print(f"Indexed {vector_store.count()} chunks.\n")
 
-embedded_chunks = pipeline.index_file("rag_principles.md")
-print(f"Stored {vector_store.count()} embedded chunks in vector store.")
+# 3. Initialize Query Time retriever via Dependency Injection
+retriever = VectorRetriever(
+    embedder=embedder,
+    vector_store=vector_store,
+)
 
-# 3. Retrieve a chunk and inspect vector representation
-first_chunk_id = embedded_chunks[0].chunk_id
-record = vector_store.get(first_chunk_id)
+# 4. Execute Top-K retrieval with optional threshold
+query = "Why does ingestion quality matter for vector embeddings?"
+results = retriever.retrieve(query, top_k=2, similarity_threshold=0.2)
 
-print(f"\nChunk ID:      {record.chunk_id}")
-print(f"Dimension:     {record.dimension}")
-print(f"Vector sample: {record.embedding[:5]}... (length={len(record.embedding)})")
-print(f"Original text: {record.text[:100]}...\n")
-
-# 4. Demonstrate query-time similarity foundation
-query_text = "Why does ingestion quality matter in RAG?"
-query_vector = embedder.embed_text(query_text)
-
-for chunk in vector_store.all_chunks()[:3]:
-    score = cosine_similarity(query_vector, chunk.embedding)
-    print(f"Chunk [{chunk.chunk_id}] Similarity to query: {score:.4f}")
+print(f"Retrieved {len(results)} relevant chunks for query: '{query}'\n")
+for rank, res in enumerate(results, start=1):
+    print(f"Rank {rank} | Score: {res.score:.4f} | Chunk ID: {res.chunk_id}")
+    print(f"Source: {res.chunk.source} | Title: {res.chunk.title}")
+    print(f"Text:\n{res.text}\n" + "-" * 50)
 ```
 
 ---
@@ -203,16 +214,22 @@ production-rag-knowledge-system/
 │       │   ├── models.py      # EmbeddedChunk data model
 │       │   ├── local.py       # LocalDeterministicEmbeddingProvider
 │       │   └── similarity.py  # Cosine, dot product, and Euclidean similarity
-│       └── indexing/          # Vector storage & index components
-│           ├── __init__.py    # Indexing exports
-│           ├── base.py        # BaseVectorStore abstract interface
-│           └── memory.py      # InMemoryVectorStore implementation
+│       ├── indexing/          # Vector storage & index components
+│       │   ├── __init__.py    # Indexing exports
+│       │   ├── base.py        # BaseVectorStore abstract interface
+│       │   └── memory.py      # InMemoryVectorStore implementation
+│       └── retrieval/         # Query-time retrieval components
+│           ├── __init__.py    # Retrieval exports
+│           ├── base.py        # BaseRetriever abstract interface
+│           ├── models.py      # RetrievalResult Pydantic model
+│           └── vector.py      # VectorRetriever implementation
 └── tests/                     # Comprehensive test suites
     ├── __init__.py
     ├── test_smoke.py                  # Smoke tests verifying package metadata
     ├── test_ingestion.py              # Tests for loading, chunking, and metadata
     ├── test_embeddings_and_storage.py # Tests for embedding, storage, and similarity
-    └── test_pipeline.py               # Tests for end-to-end indexing pipeline
+    ├── test_pipeline.py               # Tests for end-to-end indexing pipeline
+    └── test_retrieval.py              # Tests for query embedding, ranking, and Top-K
 ```
 
 ---
@@ -228,11 +245,8 @@ source .venv/bin/activate
 # Run pytest across all test suites
 pytest -v
 
-# Run embedding and storage tests specifically
-pytest tests/test_embeddings_and_storage.py -v
-
-# Run end-to-end indexing pipeline tests
-pytest tests/test_pipeline.py -v
+# Run retrieval tests specifically
+pytest tests/test_retrieval.py -v
 ```
 
 ---
@@ -252,6 +266,13 @@ pytest tests/test_pipeline.py -v
    - [x] `BaseVectorStore` abstract interface & `InMemoryVectorStore`
    - [x] Mathematical vector similarity foundations (Cosine, Dot Product, Euclidean Distance)
    - [x] End-to-end `IndexingPipeline` connecting ingestion, chunking, embedding, and storage
-4. [ ] **Phase 3: Hybrid Retrieval (Dense + BM25) & Re-ranking**
-5. [ ] **Phase 4: Synthesis, Grounding & Citations**
-6. [ ] **Phase 5: Evaluation, Guardrails & Benchmarking**
+4. [x] **Phase 3: Dense Vector Retrieval (Top-K Similarity Search)**
+   - [x] `BaseRetriever` abstract interface
+   - [x] Structured `RetrievalResult` model with query-time score encapsulation
+   - [x] `VectorRetriever` with dependency injection (`EmbeddingProvider`, `BaseVectorStore`)
+   - [x] Exact cosine similarity search, descending ranking, and Top-K selection
+   - [x] Configurable similarity threshold filtering
+   - [x] Comprehensive test suite covering validation, empty stores, ranking, and determinism
+5. [ ] **Phase 4: Hybrid Retrieval (Dense + BM25) & Re-ranking**
+6. [ ] **Phase 5: Synthesis, Grounding & Citations**
+7. [ ] **Phase 6: Evaluation, Guardrails & Benchmarking**

@@ -11,7 +11,7 @@ A fundamental architectural principle of production RAG systems is the strict li
 
 ```
 ========================================================================================
-INDEXING TIME (Offline / Ingestion Pipeline — CURRENT MILESTONE)
+1. INDEXING TIME (Offline Ingestion & Storage — IMPLEMENTED)
 ========================================================================================
 
   Raw Document (UTF-8 Markdown / Text)
@@ -30,34 +30,46 @@ INDEXING TIME (Offline / Ingestion Pipeline — CURRENT MILESTONE)
 
 
 ========================================================================================
-QUERY TIME (Online / Retrieval & Generation — FUTURE MILESTONES)
+2. QUERY TIME: RETRIEVAL PHASE (Online Search & Ranking — CURRENT MILESTONE)
 ========================================================================================
 
   User Query: "Why does ingestion quality matter in RAG?"
         │
         ▼
-  Query Processor (intent routing, hypothetical document expansion / HyDE)
+  VectorRetriever (BaseRetriever interface with dependency injection)
         │
         ▼
   EmbeddingProvider.embed_text(query)
         │
         ▼  [Query Vector: 1 x D]
-  Vector Index / Database (Approximate / Exact Nearest Neighbor Search)
-        │
-        ▼  [Top-K Candidate Chunks]
-  Re-ranking Layer (Cross-encoder scoring, context compression, deduplication)
-        │
-        ▼  [Top-N Ranked Chunks with Source Metadata]
-  Prompt Assembly & Generation Layer (Grounded prompt context bounding)
+  InMemoryVectorStore exact linear scan:
+  cos(theta) = (q . c) / (|q| * |c|) computed against each stored chunk
         │
         ▼
-  LLM Generation & Evaluation (Response synthesis + citation attribution + faithfulness check)
-```
+  Threshold Filtering (optional: score >= similarity_threshold)
+        │
+        ▼
+  Score Sorting (descending) & Top-K Slicing
+        │
+        ▼
+  List[RetrievalResult] (chunk payload + query-time similarity score + metadata)
 
-> **Note on Current Scope**:
-> In this milestone, only the **Indexing Time** pipeline is implemented:
-> `Document` $\rightarrow$ `Chunk` $\rightarrow$ `Embedding` $\rightarrow$ `Vector Store/Index`.
-> The query-time retrieval, re-ranking, and LLM generation layers are explicitly deferred to future milestones.
+
+========================================================================================
+3. QUERY TIME: SYNTHESIS PHASE (Generation & Evaluation — FUTURE MILESTONES)
+========================================================================================
+
+  Top-K Chunks with Source Lineage
+        │
+        ▼
+  Re-ranking Layer (Cross-encoder scoring, context compression, deduplication) [Future]
+        │
+        ▼
+  Prompt Assembly (Context bounding, injection protection, citation rules) [Future]
+        │
+        ▼
+  LLM Generation & Evaluation (Faithfulness, answer relevance, source attribution) [Future]
+```
 
 ---
 
@@ -74,24 +86,48 @@ QUERY TIME (Online / Retrieval & Generation — FUTURE MILESTONES)
 
 ### 2. Embedding Layer (`src/production_rag/embeddings/`)
 - **`base.py`**:
-  - `EmbeddingProvider` (ABC): Defines the contract for embedding models: `dimension`, `embed_text()`, and `embed_texts()`. Keeps the RAG pipeline decoupled from specific model providers.
+  - `EmbeddingProvider` (ABC): Contract for embedding models: `dimension`, `embed_text()`, and `embed_texts()`. Keeps the RAG pipeline decoupled from specific model providers.
 - **`models.py`**:
   - `EmbeddedChunk`: Extends the chunk representation to include the dense vector (`embedding: list[float]`). **Strictly preserves the original raw text and metadata**—the embedding is a numerical search coordinate, not a replacement for text payload.
 - **`local.py`**:
-  - `LocalDeterministicEmbeddingProvider`: Zero-external-dependency, offline embedding provider utilizing signed subword feature projections and L2-normalization.
+  - `LocalDeterministicEmbeddingProvider`: Signed subword feature projection and $L_2$-normalization ($D=128$). Designed for offline, deterministic learning and continuous integration.
 - **`similarity.py`**:
-  - Standalone mathematical functions (`cosine_similarity`, `dot_product`, `euclidean_distance`) preparing the foundation for future similarity search without coupling to a full retrieval engine.
+  - Mathematical distance functions (`cosine_similarity`, `dot_product`, `euclidean_distance`).
 
 ### 3. Vector Storage / Index Layer (`src/production_rag/indexing/`)
 - **`base.py`**:
-  - `BaseVectorStore` (ABC): Storage abstraction providing `add()`, `add_many()`, `get()`, `count()`, and `contains()`. Allows swapping in-memory storage for persistent backends (Qdrant, pgvector) without downstream code modification.
+  - `BaseVectorStore` (ABC): Storage abstraction providing `add()`, `add_many()`, `get()`, `count()`, and `contains()`.
 - **`memory.py`**:
-  - `InMemoryVectorStore`: Fast in-memory hash store with strict dimensionality checks, preserving chunk records, raw text, and vector coordinates.
+  - `InMemoryVectorStore`: In-memory vector store with strict dimensionality checks. Performs exact brute-force linear comparisons ($O(N)$), providing the baseline for future Approximate Nearest Neighbor (ANN) indexes.
 
-### 4. Indexing Pipeline Orchestration (`src/production_rag/pipeline.py`)
+### 4. Retrieval Layer (`src/production_rag/retrieval/`)
+- **`base.py`**:
+  - `BaseRetriever` (ABC): Interface defining query-time retrieval: `retrieve(query, top_k, similarity_threshold) -> list[RetrievalResult]`.
+- **`models.py`**:
+  - `RetrievalResult`: Encapsulates an `EmbeddedChunk` and its query-time similarity `score`. Crucially, similarity scores are ephemeral and query-dependent; they are never permanently stored on the chunk.
+- **`vector.py`**:
+  - `VectorRetriever`: Concrete retriever using dependency injection to bind an `EmbeddingProvider` and a `BaseVectorStore`. Embeds queries, computes exact cosine similarities against stored chunks, applies optional threshold filtering, sorts descending, and returns Top-K results.
+
+### 5. Indexing Pipeline Orchestration (`src/production_rag/pipeline.py`)
 - **`IndexingPipeline`**:
   - Coordinates `LocalFileLoader` $\rightarrow$ `TextChunker` $\rightarrow$ `EmbeddingProvider` $\rightarrow$ `BaseVectorStore`.
   - Provides `index_file()` and `index_directory()` entry points.
+
+---
+
+## Key Technical Distinctions
+
+### Exact Scan vs. Approximate Nearest Neighbor (ANN)
+The current `InMemoryVectorStore` + `VectorRetriever` calculates the cosine similarity against **every single stored vector** (brute-force linear scan).
+- **Complexity**: $O(N \cdot D)$, where $N$ is chunk count and $D$ is vector dimension.
+- **Accuracy**: 100% exact mathematical recall.
+- **Evolution Path**: When scaling to hundreds of thousands of documents, an Approximate Nearest Neighbor index (e.g. HNSW, IVF) will be introduced to achieve $O(\log N)$ query latencies.
+
+### Development Feature Projection vs. Production Semantic Embeddings
+`LocalDeterministicEmbeddingProvider` uses signed subword hash projections:
+- **Nature**: Fast, zero-dependency, deterministic feature hashing.
+- **Scope**: Captures lexical and subword overlap in continuous vector space.
+- **Evolution Path**: Designed to be hot-swappable via `EmbeddingProvider` with dense pretrained neural transformer models (e.g. `bge-small-en-v1.5`, `all-MiniLM-L6-v2`, OpenAI `text-embedding-3-small`).
 
 ---
 
@@ -113,16 +149,21 @@ src/production_rag/
 │   ├── models.py              # EmbeddedChunk
 │   ├── local.py               # LocalDeterministicEmbeddingProvider
 │   └── similarity.py          # Vector similarity metrics
-└── indexing/                  # Vector storage & index abstractions
+├── indexing/                  # Vector storage & index abstractions
+│   ├── __init__.py
+│   ├── base.py                # BaseVectorStore (ABC)
+│   └── memory.py              # InMemoryVectorStore
+└── retrieval/                 # Query-time retrieval components
     ├── __init__.py
-    ├── base.py                # BaseVectorStore (ABC)
-    └── memory.py              # InMemoryVectorStore
+    ├── base.py                # BaseRetriever (ABC)
+    ├── models.py              # RetrievalResult
+    └── vector.py              # VectorRetriever
 ```
 
 ---
 
 ## Future Roadmap Evolution
-- `src/production_rag/retrieval`: Hybrid search (dense semantic + sparse BM25) and reciprocal rank fusion.
+- `src/production_rag/retrieval/hybrid.py`: Hybrid search (dense vector + sparse BM25) and reciprocal rank fusion (RRF).
 - `src/production_rag/reranking`: Cross-encoder scoring models and contextual deduplication.
 - `src/production_rag/generation`: Grounded prompt assembly, LLM streaming, and citation attribution.
 - `src/production_rag/evaluation`: Faithfulness, answer relevance, context recall, and observability.
