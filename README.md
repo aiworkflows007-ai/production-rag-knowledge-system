@@ -9,28 +9,32 @@ A systematic, production-grade Retrieval-Augmented Generation (RAG) learning pro
 Most RAG tutorials demonstrate toy examples (simple chunking + naive vector search + single prompt). In contrast, this project is dedicated to engineering a **production-ready RAG pipeline** handling real-world challenges:
 
 - **Data Ingestion & Preprocessing**: Clean parsing, document structure awareness, dynamic and semantic chunking.
+- **Embedding Generation & Vector Storage**: Decoupled embedding providers, typed embedded chunks, and extensible vector storage.
 - **Hybrid Retrieval**: Combining dense vector embeddings (semantic similarity) with sparse retrieval (BM25 lexical search) via Reciprocal Rank Fusion (RRF).
 - **Post-Retrieval Processing & Re-ranking**: Cross-encoder rerankers, contextual compression, and relevance filtering to combat the "lost in the middle" phenomenon.
 - **Grounded Generation**: Prompt engineering with strict context bounding, source attribution, and citation enforcement.
 - **Evaluation & Observability**: Quantitative evaluation (faithfulness, answer relevance, context recall/precision) and token/latency tracing.
 
-> **Current Milestone**: **Document Ingestion & Basic Chunking**.
-> No heavy RAG frameworks (LangChain, LlamaIndex, vector databases, or LLMs) are used. The ingestion layer is implemented from clean fundamentals using typed models and deterministic algorithms.
+> **Current Milestone**: **Ingestion, Chunking, Embedding Generation, & Vector Storage/Index**.
+> Architecture strictly decouples embedding models, data models, and vector stores without relying on bulky all-in-one frameworks.
 
 ---
 
-## What Ingestion Means in a RAG System
+## The Indexing Pipeline
 
-In a production RAG system, **ingestion** is the foundational stage responsible for converting raw, unstructured knowledge into structured, digestible, and traceable units:
+```text
+Raw Document
+     ↓
+ Ingestion            (LocalFileLoader reads UTF-8, extracts title, assigns deterministic document_id)
+     ↓
+  Chunking            (TextChunker splits text into structured Chunks with boundary snapping)
+     ↓
+ Embedding            (EmbeddingProvider transforms chunk text into dense numerical vectors)
+     ↓
+Vector Store / Index  (BaseVectorStore indexes EmbeddedChunks for fast retrieval & metadata lookup)
+```
 
-1. **Source Loading**: Reading documents (Markdown, text, PDFs) from storage while enforcing valid character encoding (UTF-8) and recording provenance metadata (file paths, file size, titles).
-2. **Deterministic Identity Generation**: Assigning deterministic, content- and source-derived identifiers (`document_id`) so that re-ingesting identical content does not pollute or duplicate index state.
-3. **Semantic Chunking**: Splitting large texts into bounded chunks that fit embedding model context windows. Instead of blindly slicing characters mid-word or mid-sentence, production chunking respects natural structural boundaries (paragraphs, newlines, sentences, spaces) and applies sliding-window overlap so context is not sheared at chunk edges.
-4. **Metadata Inheritance & Lineage**: Every emitted chunk preserves its parent `document_id`, `source`, `title`, and positional offsets (`start_char`, `end_char`), ensuring any retrieved chunk can be cited with exact provenance back to the source document.
-
----
-
-## Current Ingestion Pipeline
+Detailed architectural visualization:
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -43,73 +47,124 @@ In a production RAG system, **ingestion** is the foundational stage responsible 
 │  - UTF-8 decoding & validation               │
 │  - Heading & title extraction                │
 │  - Deterministic document_id generation      │
-│  - Provenance metadata enrichment            │
 └──────────────────────┬───────────────────────┘
                        │ Document (Pydantic Model)
                        ▼
 ┌──────────────────────────────────────────────┐
 │  TextChunker                                 │
 │  - Sliding window (chunk_size, chunk_overlap)│
-│  - Boundary snapping (paragraphs/sentences)   │
-│  - Word boundary preservation (no cut words) │
+│  - Delimiter boundary snapping (no cut words)│
 │  - Monotonic chunk_index (0, 1, 2, ...)      │
-│  - Deterministic chunk_id generation         │
 └──────────────────────┬───────────────────────┘
                        │ List[Chunk] (Pydantic Models)
                        ▼
 ┌──────────────────────────────────────────────┐
-│  Structured Chunks Ready for Future Indexing │
+│  EmbeddingProvider                           │
+│  - Decoupled interface (base.py)             │
+│  - LocalDeterministicEmbeddingProvider       │
+│  - Signed subword feature projection (D=128) │
+│  - Unit L2-normalized dense vectors          │
+└──────────────────────┬───────────────────────┘
+                       │ List[EmbeddedChunk]
+                       ▼
+┌──────────────────────────────────────────────┐
+│  VectorStore / Index (InMemoryVectorStore)   │
+│  - O(1) ID lookups & dimension validation    │
+│  - Preserves original chunk text & metadata  │
+│  - Foundation for future similarity search   │
 └──────────────────────────────────────────────┘
 ```
 
 ---
 
-## Example: Input Document → Structured Chunks
+## Core Concepts: Embeddings & Vector Indexing
 
-Using the sample document located at [`data/raw/rag_principles.md`](file:///home/ashok/Projects/production-rag-knowledge-system/data/raw/rag_principles.md):
+### 1. WHAT is an embedding?
+An **embedding** is a dense numerical vector (a list of floating-point numbers, such as 128, 384, or 1536 dimensions) representing the syntactic and semantic essence of a text passage. Texts with similar topical meanings or vocabulary overlap map to coordinates that are mathematically close to one another in geometric vector space.
+
+### 2. WHY do we create embeddings?
+Computers cannot directly calculate semantic closeness using raw character strings. Traditional keyword matching fails when synonyms or rephrased queries are used (e.g., `"automobile repair"` vs `"car maintenance"`). Embeddings convert human language into geometric points, enabling algorithms to compute similarity using mathematical distance metrics.
+
+### 3. WHAT does the embedding model do?
+The **embedding model** (represented by `EmbeddingProvider`) is a pure transformation function:
+$$\text{text} \longrightarrow \text{vector} \in \mathbb{R}^D$$
+It accepts raw text, tokenizes it, and outputs a normalized fixed-dimensional vector. It does not store vectors or know about databases; its sole responsibility is vector generation.
+
+### 4. WHAT does the vector index do?
+The **vector index / vector store** (`BaseVectorStore`) is a specialized data structure and storage engine that stores the embeddings together with their associated chunk metadata and raw text. In later retrieval stages, it organizes these high-dimensional points so that nearest-neighbor queries can be executed in sub-linear time.
+
+### 5. WHY do we keep the original chunk text?
+The embedding is purely a mathematical coordinate for spatial indexing; **it is NOT a replacement for the text**.
+- An embedding vector cannot be read by human users or passed directly into an LLM context window.
+- When relevant chunks are retrieved at query time, the system passes the **original human-readable text** into the LLM's prompt context to synthesize a truthful, grounded response with exact citations.
+- Therefore, `EmbeddedChunk` strictly preserves the original `text`, parent `document_id`, `chunk_id`, and `metadata`.
+
+### 6. IMPORTANT: Similarity Scores Are Computed at Query Time
+> **Critical Architectural Principle**:
+> A similarity score is **never permanently assigned** to a chunk during indexing.
+> - At **Indexing Time**: Chunks are embedded and their vectors are stored. There is no user query yet, so no similarity score exists.
+> - At **Query Time**: When a user asks a question, the *query itself* is converted into an embedding vector by the embedding model. That query vector is compared against all stored chunk vectors using a similarity metric (e.g., Cosine Similarity) to calculate a dynamic, query-specific relevance score.
+
+---
+
+## Similarity Metrics Prepared
+
+The system prepares for future similarity search by producing L2-normalized unit vectors ($\|v\|_2 = 1.0$) and providing standard distance functions:
+
+1. **Cosine Similarity**:
+   $$\cos(\theta) = \frac{\mathbf{u} \cdot \mathbf{v}}{\|\mathbf{u}\|_2 \|\mathbf{v}\|_2}$$
+   Measures the angle between two vectors, invariant to scale, returning a value between $-1.0$ and $+1.0$.
+2. **Dot Product (Inner Product)**:
+   $$\mathbf{u} \cdot \mathbf{v} = \sum_{i=1}^D u_i v_i$$
+   For unit-normalized vectors ($\|\mathbf{u}\|_2 = \|\mathbf{v}\|_2 = 1$), dot product is mathematically equivalent to cosine similarity but computationally faster (requires no division).
+3. **Euclidean Distance (L2)**:
+   $$d(\mathbf{u}, \mathbf{v}) = \sqrt{\sum_{i=1}^D (u_i - v_i)^2}$$
+   Measures straight-line geometric distance. For unit vectors, Euclidean distance is monotonically related to cosine distance: $d^2 = 2 - 2\cos(\theta)$.
+
+---
+
+## Example: Ingestion → Chunking → Embedding → Vector Storage
 
 ```python
 from pathlib import Path
+from production_rag.embeddings import LocalDeterministicEmbeddingProvider, cosine_similarity
+from production_rag.indexing import InMemoryVectorStore
 from production_rag.ingestion import LocalFileLoader, TextChunker
+from production_rag.pipeline import IndexingPipeline
 
-# 1. Load source document
+# 1. Initialize components
 loader = LocalFileLoader(base_dir=Path("data/raw"))
-doc = loader.load_file("rag_principles.md")
-
-print(f"Document ID: {doc.document_id}")
-print(f"Title:       {doc.title}")
-print(f"Source:      {doc.source}")
-
-# 2. Chunk document with sliding window
 chunker = TextChunker(chunk_size=350, chunk_overlap=50)
-chunks = chunker.chunk_document(doc)
-print(f"Total Chunks: {len(chunks)}\n")
+embedder = LocalDeterministicEmbeddingProvider(dimension=128)
+vector_store = InMemoryVectorStore()
 
-for chunk in chunks[:2]:
-    print(f"[{chunk.chunk_id}] (index={chunk.chunk_index}, chars={chunk.character_count})")
-    print(chunk.content)
-    print("-" * 50)
-```
+# 2. Build and run the indexing pipeline
+pipeline = IndexingPipeline(
+    loader=loader,
+    chunker=chunker,
+    embedder=embedder,
+    vector_store=vector_store,
+)
 
-**Output:**
-```text
-Document ID: doc_33658e4f813af600
-Title:       Production RAG Engineering Principles
-Source:      rag_principles.md
-Total Chunks: 5
+embedded_chunks = pipeline.index_file("rag_principles.md")
+print(f"Stored {vector_store.count()} embedded chunks in vector store.")
 
-[doc_33658e4f813af600#chunk_0000] (index=0, chars=322)
-# Production RAG Engineering Principles
+# 3. Retrieve a chunk and inspect vector representation
+first_chunk_id = embedded_chunks[0].chunk_id
+record = vector_store.get(first_chunk_id)
 
-Retrieval-Augmented Generation (RAG) is an architectural pattern that supplements large language model prompts with dynamic external context. Rather than relying solely on parametric weights learned during pre-training, RAG grounds generations in verifiable, proprietary documents.
---------------------------------------------------
-[doc_33658e4f813af600#chunk_0001] (index=1, chars=335)
-generations in verifiable, proprietary documents.
+print(f"\nChunk ID:      {record.chunk_id}")
+print(f"Dimension:     {record.dimension}")
+print(f"Vector sample: {record.embedding[:5]}... (length={len(record.embedding)})")
+print(f"Original text: {record.text[:100]}...\n")
 
-## Why Ingestion Quality Matters
+# 4. Demonstrate query-time similarity foundation
+query_text = "Why does ingestion quality matter in RAG?"
+query_vector = embedder.embed_text(query_text)
 
-The retrieval layer can never be better than the ingestion layer feeding it. If source documents are parsed with garbled text, broken formatting, or chopped-off sentences, downstream vector embeddings will represent noise rather than semantic intent.
---------------------------------------------------
+for chunk in vector_store.all_chunks()[:3]:
+    score = cosine_similarity(query_vector, chunk.embedding)
+    print(f"Chunk [{chunk.chunk_id}] Similarity to query: {score:.4f}")
 ```
 
 ---
@@ -136,22 +191,35 @@ production-rag-knowledge-system/
 │   └── production_rag/        # Primary Python package
 │       ├── __init__.py        # Package exports
 │       ├── config.py          # Environment and application settings
-│       └── ingestion/         # Ingestion layer components
-│           ├── __init__.py    # Ingestion exports
-│           ├── models.py      # Pydantic Document and Chunk models
-│           ├── loader.py      # Local UTF-8 file and directory loader
-│           └── chunker.py     # Deterministic boundary-snapping chunker
+│       ├── pipeline.py        # IndexingPipeline connecting ingestion to vector store
+│       ├── ingestion/         # Ingestion layer components
+│       │   ├── __init__.py    # Ingestion exports
+│       │   ├── models.py      # Pydantic Document and Chunk models
+│       │   ├── loader.py      # Local UTF-8 file and directory loader
+│       │   └── chunker.py     # Deterministic boundary-snapping chunker
+│       ├── embeddings/        # Embedding generation components
+│       │   ├── __init__.py    # Embeddings exports
+│       │   ├── base.py        # EmbeddingProvider abstract base class
+│       │   ├── models.py      # EmbeddedChunk data model
+│       │   ├── local.py       # LocalDeterministicEmbeddingProvider
+│       │   └── similarity.py  # Cosine, dot product, and Euclidean similarity
+│       └── indexing/          # Vector storage & index components
+│           ├── __init__.py    # Indexing exports
+│           ├── base.py        # BaseVectorStore abstract interface
+│           └── memory.py      # InMemoryVectorStore implementation
 └── tests/                     # Comprehensive test suites
     ├── __init__.py
-    ├── test_smoke.py          # Smoke tests verifying package metadata
-    └── test_ingestion.py      # Unit tests for loading, chunking, and metadata
+    ├── test_smoke.py                  # Smoke tests verifying package metadata
+    ├── test_ingestion.py              # Tests for loading, chunking, and metadata
+    ├── test_embeddings_and_storage.py # Tests for embedding, storage, and similarity
+    └── test_pipeline.py               # Tests for end-to-end indexing pipeline
 ```
 
 ---
 
 ## Running the Tests
 
-To run the full unit test suite:
+To run the complete test suite:
 
 ```bash
 # Activate virtual environment
@@ -160,8 +228,11 @@ source .venv/bin/activate
 # Run pytest across all test suites
 pytest -v
 
-# Or run tests specifically for the ingestion layer
-pytest tests/test_ingestion.py -v
+# Run embedding and storage tests specifically
+pytest tests/test_embeddings_and_storage.py -v
+
+# Run end-to-end indexing pipeline tests
+pytest tests/test_pipeline.py -v
 ```
 
 ---
@@ -173,8 +244,14 @@ pytest tests/test_ingestion.py -v
    - [x] Structured `Document` and `Chunk` schemas with metadata
    - [x] Local text and Markdown file/directory loader
    - [x] Deterministic sliding-window chunker with boundary snapping
-   - [x] Unit test suite covering loading, empty files, chunking, ordering, and determinism
-3. [ ] **Phase 2: Embedding Generation & Vector Indexing**
+   - [x] Ingestion unit test suite
+3. [x] **Phase 2: Embedding Generation & Vector Indexing**
+   - [x] Decoupled `EmbeddingProvider` abstract interface
+   - [x] Deterministic local dense embedding provider (`LocalDeterministicEmbeddingProvider`)
+   - [x] Structured `EmbeddedChunk` model preserving original text, metadata, and vectors
+   - [x] `BaseVectorStore` abstract interface & `InMemoryVectorStore`
+   - [x] Mathematical vector similarity foundations (Cosine, Dot Product, Euclidean Distance)
+   - [x] End-to-end `IndexingPipeline` connecting ingestion, chunking, embedding, and storage
 4. [ ] **Phase 3: Hybrid Retrieval (Dense + BM25) & Re-ranking**
 5. [ ] **Phase 4: Synthesis, Grounding & Citations**
 6. [ ] **Phase 5: Evaluation, Guardrails & Benchmarking**
