@@ -62,8 +62,10 @@ htmlcov/
 *.chroma
 *.index
 
-# Data files (keep directory tracking via .gitkeep)
+# Data files (keep directory tracking via .gitkeep, ignore actual datasets)
 data/raw/*
 !data/raw/.gitkeep
+!data/raw/rag_principles.md
+!data/raw/sample_*.md
 data/processed/*
 !data/processed/.gitkeep

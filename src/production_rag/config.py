@@ -3,8 +3,8 @@
 This module provides initial configuration settings loaded from environment variables.
 """
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
